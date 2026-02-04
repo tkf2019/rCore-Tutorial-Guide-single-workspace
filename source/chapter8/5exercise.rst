@@ -7,7 +7,12 @@ chapter8 练习
 .. warning::
 
    本次实验框架变动较大，且改动较为复杂，为降低同学们的工作量，本次实验不要求合并之前的实验内容（除 ``sys_get_time`` 以外），
-   只需通过 ch8 的全部测例和其他章节的基础测例即可。你可以直接在实验框架的 ch8 分支上完成以下作业。
+   只需通过 ch8 的全部测例和其他章节的基础测例即可。你可以直接在 ``rCore-Tutorial-in-single-workspace/ch8``
+   目录（crate: ``tg-ch8``）上完成以下作业。
+
+.. note::
+
+   练习模式的运行方式为在 ``ch8`` 目录下执行 ``cargo run --features exercise`` （或运行 ``./test.sh exercise``）。
 
 .. note::
 
@@ -39,7 +44,7 @@ chapter8 练习
    设置 Finish[i] = true。
 2. 从线程集合中找到一个能满足下述条件的线程
 
-.. code-block:: Rust
+.. code-block:: rust
    :linenos:
 
    Finish[i] == false;
@@ -49,7 +54,7 @@ chapter8 练习
 
 3. 当线程 thr[i] 获得资源后，可顺利执行，直至完成，并释放出分配给它的资源，故应执行:
 
-.. code-block:: Rust
+.. code-block:: rust
    :linenos:
 
    Work[j] = Work[j] + Allocation[i, j];
@@ -60,14 +65,14 @@ chapter8 练习
 4. 如果 Finish[0..n-1] 都为 true，则表示系统处于安全状态；否则表示系统处于不安全状态，即出现死锁。
 
 出于兼容性和灵活性考虑，我们允许进程按需开启或关闭死锁检测功能。为此我们将实现一个新的系统调用：
-``sys_enable_deadlock_detect`` 。
+``enable_deadlock_detect`` 。
 
 **enable_deadlock_detect**：
 
 * syscall ID:  469
 * 功能：为当前进程启用或禁用死锁检测功能。
 * C 接口： ``int enable_deadlock_detect(int is_enable)``
-* Rust 接口： ``fn enable_deadlock_detect(is_enable: i32) -> i32``
+* Rust 接口： ``fn enable_deadlock_detect(is_enable: bool) -> isize``
 * 参数：
     * is_enable: 为 1 表示启用死锁检测， 0 表示禁用死锁检测。
 * 说明：
@@ -84,20 +89,20 @@ chapter8 练习
 实验要求
 +++++++++++++++++++++++++++++++++++++++++
 
-- 完成分支: ch8。
+- 完成目录: ``rCore-Tutorial-in-single-workspace/ch8`` 。
 - 实验目录要求不变。
 - 通过所有测例。
 
 问答作业
 --------------------------------------------
 
-1. 在我们的多线程实现中，当主线程 (即 0 号线程) 退出时，视为整个进程退出，
-   此时需要结束该进程管理的所有线程并回收其资源。
+1. 在我们的多线程实现中，当一个进程内 **最后一个线程** 退出时，视为整个进程退出，
+   此时需要回收该进程与其线程相关的资源。
    - 需要回收的资源有哪些？
-   - 其他线程的 TaskControlBlock 可能在哪些位置被引用，分别是否需要回收，为什么？
+   - 其他线程（``Thread``）的实体可能在哪些位置被引用（例如调度就绪队列、同步原语等待队列、进程-线程关系表等），分别是否需要回收，为什么？
 2. 对比以下两种 ``Mutex`` 中的实现，二者有什么区别？这些区别可能会导致什么问题？
 
-.. code-block:: Rust
+.. code-block:: rust
     :linenos:
 
     impl Mutex for Mutex1 {

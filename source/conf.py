@@ -32,19 +32,34 @@ html_search_language = 'zh'
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = [
-    "sphinx_comments",
-#    "sphinx_tabs.tabs"
-]
+#
+# NOTE: Some extensions are optional in different build environments.
+# We enable them only when importable so `make html` doesn't fail when
+# the dependency isn't installed.
+extensions = []
+
+try:
+    import sphinx_comments  # type: ignore  # noqa: F401
+except ModuleNotFoundError:
+    sphinx_comments = None
+else:
+    extensions.append("sphinx_comments")
+
+# try:
+#     import sphinx_tabs  # type: ignore  # noqa: F401
+# except ModuleNotFoundError:
+#     sphinx_tabs = None
+# else:
+#     extensions.append("sphinx_tabs.tabs")
 
 comments_config = {
-   "utterances": {
-       "repo": "LearningOS/rCore-Tutorial-Guide",
-       "issue-term": "pathname",
-       "label": "comments",
-       "theme": "github-light",
-       "crossorigin": "anonymous",
-   }
+    "utterances": {
+        "repo": "LearningOS/rCore-Tutorial-Guide",
+        "issue-term": "pathname",
+        "label": "comments",
+        "theme": "github-light",
+        "crossorigin": "anonymous",
+    }
 }
 
 # Add any paths that contain templates here, relative to this directory.
@@ -61,7 +76,18 @@ exclude_patterns = []
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'furo'
+import importlib.util as _importlib_util
+
+def _theme_available(dist_module_name: str) -> bool:
+    return _importlib_util.find_spec(dist_module_name) is not None
+
+# Prefer modern theme when available, but don't fail builds if not installed.
+if _theme_available("furo"):
+    html_theme = "furo"
+elif _theme_available("sphinx_rtd_theme"):
+    html_theme = "sphinx_rtd_theme"
+else:
+    html_theme = "alabaster"
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,

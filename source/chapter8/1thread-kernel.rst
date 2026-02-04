@@ -45,13 +45,15 @@
    /// 功能：当前进程创建一个新的线程
    /// 参数：entry 表示线程的入口函数地址
    /// 参数：arg：表示线程的一个参数
-   pub fn sys_thread_create(entry: usize, arg: usize) -> isize
+   pub fn thread_create(entry: usize, arg: usize) -> isize
 
 当进程调用 ``thread_create`` 系统调用后，内核会在这个进程内部创建一个新的线程，这个线程能够访问到进程所拥有的代码段，
 堆和其他数据段。但内核会给这个新线程分配一个它专有的用户态栈，这样每个线程才能相对独立地被调度和执行。
-另外，由于用户态进程与内核之间有各自独立的页表，所以二者需要有一个跳板页 ``TRAMPOLINE``
-来处理用户态切换到内核态的地址空间平滑转换的事务。所以当出现线程后，在进程中的每个线程也需要有一个独立的跳板页
-``TRAMPOLINE`` 来完成同样的事务。
+在本教程的组件化实现中，线程切换与特权级切换由 ``tg-kernel-context`` 提供的“异界传送门”
+（``MultislotPortal``）完成：每个线程的执行上下文中都包含它所属用户地址空间的页表根（``satp``），
+内核在切换线程时根据该 ``satp`` 进入对应的用户地址空间运行；当发生 ``ecall``/异常时，会返回到内核继续处理。
+为了让“进入/返回”过程在不同地址空间之间保持一致，内核会把传送门映射到每个用户地址空间的固定虚页位置
+（见 ``ch8/src/main.rs`` 中的 ``PROTAL_TRANSIT`` 与 ``map_portal``）。
 
 相比于创建进程的 ``fork`` 系统调用，创建线程不需要要建立新的地址空间，这是二者之间最大的不同。
 另外属于同一进程中的线程之间没有父子关系，这一点也与进程不一样。
@@ -60,21 +62,20 @@
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 当一个线程执行完代表它的功能后，会通过 ``exit`` 系统调用退出。内核在收到线程发出的 ``exit`` 系统调用后，
-会回收线程占用的部分资源，即用户态用到的资源，比如用户态的栈，用于系统调用和异常处理的跳板页等。
-而该线程的内核态用到的资源，比如内核栈等，需要通过进程/主线程调用 ``waittid`` 来回收了，
-这样整个线程才能被彻底销毁。系统调用 ``waittid`` 的原型如下：
+会结束该线程的调度实体，并记录退出码。此后，进程内的其他线程可以通过 ``waittid`` 等待该线程结束并获取其退出码。
+系统调用 ``waittid`` 的原型如下：
 
 .. code-block:: rust
    :linenos:
 
    /// 参数：tid表示线程id
    /// 返回值：如果线程不存在，返回-1；如果线程还没退出，返回-2；其他情况下，返回结束线程的退出码
-   pub fn sys_waittid(tid: usize) -> i32
+   pub fn waittid(tid: usize) -> isize
 
 
-一般情况下进程/主线程要负责通过 ``waittid`` 来等待它创建出来的线程（不是主线程）结束并回收它们在内核中的资源
-（如线程的内核栈、线程控制块等）。如果进程/主线程先调用了 ``exit`` 系统调用来退出，那么整个进程
-（包括所属的所有线程）都会退出，而对应父进程会通过 ``waitpid`` 回收子进程剩余还没被回收的资源。
+一般情况下，创建线程的那条线程会通过 ``waittid`` 等待子线程结束并获取退出码。
+在本章的实现中，线程退出只会结束当前线程；当一个进程内 **最后一个线程** 退出时，该进程才会被内核删除。
+进程级别的资源回收仍由 ``waitpid``（``wait``/``waitpid`` 系列系统调用）完成。
 
 
 进程相关的系统调用
@@ -97,23 +98,24 @@
 系统调用封装
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-同学可以在 user/src/syscall.rs 中看到以 sys_* 开头的系统调用的函数原型，它们后续还会在 user/src/lib.rs 中被封装成方便应用程序使用的形式。如 ``sys_thread_create`` 被封装成 ``thread_create`` ，而 ``sys_waittid`` 被封装成 ``waittid``  ：
+本教程将系统调用的“用户态封装”放在 ``tg-syscall`` 组件中（``tg-syscall/src/user.rs``）。
+其中 ``waittid`` 的封装方式与第三章的 ``waitpid`` 类似：当内核返回 ``-2``（目标线程仍在运行）时，
+用户态主动 ``sched_yield`` 让出 CPU，避免忙等占用处理器。
 
 .. code-block:: rust
    :linenos:
 
-   pub fn thread_create(entry: usize, arg: usize) -> isize { sys_thread_create(entry, arg) }
-
    pub fn waittid(tid: usize) -> isize {
        loop {
-           match sys_waittid(tid) {
-               -2 => { yield_(); }
+           match unsafe { syscall1(SyscallId::WAITID, tid) } {
+               -2 => { sched_yield(); }
                exit_code => return exit_code,
            }
        }
    }
 
-waittid 等待一个线程标识符的值为tid 的线程结束。在具体实现方面，我们看到当 sys_waittid 返回值为 -2 ，即要等待的线程存在但它却尚未退出的时候，主线程调用 ``yield_`` 主动交出 CPU 使用权，待下次 CPU 使用权被内核交还给它的时候再次调用 sys_waittid 查看要等待的线程是否退出。这样做是为了减小 CPU 资源的浪费。这种方法是为了尽可能简化内核的实现。
+waittid 等待一个线程标识符的值为 tid 的线程结束。当返回值为 ``-2`` 时表示“线程存在但尚未退出”，
+此时通过 ``sched_yield`` 让出 CPU，下一次被调度运行时再重试。
 
 
 多线程应用程序 -- threads
@@ -124,7 +126,7 @@ waittid 等待一个线程标识符的值为tid 的线程结束。在具体实�
 .. code-block:: rust
    :linenos:
 
-   //usr/src/bin/ch8b_threads.rs
+   // tg-user/src/bin/threads.rs
 
    #![no_std]
    #![no_main]
@@ -133,31 +135,31 @@ waittid 等待一个线程标识符的值为tid 的线程结束。在具体实�
    extern crate user_lib;
    extern crate alloc;
 
-   use user_lib::{thread_create, waittid, exit};
-   use alloc::vec::Vec;
+   use user_lib::{exit, thread_create, waittid};
 
-   pub fn thread_a() -> ! {
+   pub fn thread_a() -> isize {
        for _ in 0..1000 { print!("a"); }
        exit(1)
    }
 
-   pub fn thread_b() -> ! {
+   pub fn thread_b() -> isize {
        for _ in 0..1000 { print!("b"); }
        exit(2)
    }
 
-   pub fn thread_c() -> ! {
+   pub fn thread_c() -> isize {
        for _ in 0..1000 { print!("c"); }
        exit(3)
    }
 
    #[no_mangle]
-   pub fn main() -> i32 {
-       let mut v = Vec::new();
-       v.push(thread_create(thread_a as usize, 0));
-       v.push(thread_create(thread_b as usize, 0));
-       v.push(thread_create(thread_c as usize, 0));
-       for tid in v.iter() {
+   pub extern "C" fn main() -> i32 {
+       let tids = [
+           thread_create(thread_a as *const () as usize, 0),
+           thread_create(thread_b as *const () as usize, 0),
+           thread_create(thread_c as *const () as usize, 0),
+       ];
+       for tid in tids.iter() {
            let exit_code = waittid(*tid as usize);
            println!("thread#{} exited with code {}", tid, exit_code);
        }
@@ -168,361 +170,139 @@ waittid 等待一个线程标识符的值为tid 的线程结束。在具体实�
 线程管理的核心数据结构
 -----------------------------------------------
 
-为了在现有进程管理的基础上实现线程管理，我们需要改进一些数据结构包含的内容及接口。
-基本思路就是把进程中与处理器相关的部分分拆出来，形成线程相关的部分。
+本章在内核实现中明确区分两类对象：
 
-本节将按照如下顺序来进行介绍：
+- **进程（Process）**：资源容器，管理同一进程内各线程共享的资源（地址空间、文件描述符表、信号模块、同步原语等）；
+- **线程（Thread）**：执行实体，管理执行上下文（寄存器上下文 + ``satp``）与线程标识符（TID）。
 
-- 任务控制块 TaskControlBlock ：表示线程的核心数据结构。
-- 任务管理器 TaskManager ：管理线程集合的核心数据结构。
-- 处理器管理结构 Processor ：用于线程调度，维护线程的处理器状态。
-
-线程控制块
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-在内核中，每个线程的执行状态和线程上下文等均保存在一个被称为线程控制块 (TCB, Task Control Block)
-的结构中，它是内核对线程进行管理的核心数据结构。在内核看来，它就等价于一个线程。
+它们位于 ``ch8/src/process.rs``：
 
 .. code-block:: rust
-    :linenos:
+   :linenos:
 
-    pub struct TaskControlBlock {
-        // immutable
-        pub process: Weak<ProcessControlBlock>,
-        pub kernel_stack: KernelStack,
-        // mutable
-        inner: UPSafeCell<TaskControlBlockInner>,
-    }
+   // ch8/src/process.rs
+   pub struct Process {
+       pub pid: ProcId,
+       pub address_space: AddressSpace<Sv39, Sv39Manager>,
+       pub fd_table: Vec<Option<Mutex<Fd>>>,
+       pub signal: Box<dyn Signal>,
+       pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
+       pub mutex_list: Vec<Option<Arc<dyn MutexTrait>>>,
+       pub condvar_list: Vec<Option<Arc<Condvar>>>,
+   }
 
-    pub struct TaskControlBlockInner {
-        pub trap_cx_ppn: PhysPageNum,
-        pub task_cx: TaskContext,
-        pub task_status: TaskStatus,
-        pub exit_code: Option<i32>,
-        pub res: Option<TaskUserRes>,
-    }
+   pub struct Thread {
+       pub tid: ThreadId,
+       pub context: ForeignContext,
+   }
 
-线程控制块就是任务控制块（TaskControlBlock），主要包括在线程初始化之后就不再变化的元数据：
-线程所属的进程和线程的内核栈，以及在运行过程中可能发生变化的元数据： UPSafeCell<TaskControlBlockInner> 。
-大部分的细节放在 ``TaskControlBlockInner`` 中：
+可以看到：同步原语列表（mutex/semaphore/condvar）归属于进程，符合“同一进程内线程共享资源”的直觉；而线程仅保存
+TID 与执行上下文。
 
-之前进程中的定义不存在的：
-
-- ``res: Option<TaskUserRes>`` 指出了用户态的线程代码执行需要的信息，这些在线程初始化之后就不再变化：
-
-.. code-block:: rust
-    :linenos:
-
-    pub struct TaskUserRes {
-        pub tid: usize,
-        pub ustack_base: usize,
-        pub process: Weak<ProcessControlBlock>,
-    }
-
-- tid：线程标识符
-- ustack_base：线程的栈顶地址
-- process：线程所属的进程
-
-与之前进程中的定义相同/类似的部分：
-
-- ``trap_cx_ppn`` 指出了应用地址空间中线程的 Trap 上下文被放在的物理页帧的物理页号。
-- ``task_cx`` 保存暂停线程的线程上下文，用于线程切换。
-- ``task_status`` 维护当前线程的执行状态。
-- ``exit_code`` 线程退出码。
-
-
-包含线程的进程控制块
+处理器与调度器
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-把线程相关数据单独组织成数据结构后，进程的结构也需要进行一定的调整：
+本章使用 ``tg-task-manage`` 组件提供的线程/进程管理框架 ``PThreadManager`` 来维护：
+
+- 线程就绪队列：选择下一条要运行的线程；
+- 线程-进程从属关系（``tid -> pid`` 映射）；
+- 进程父子关系与 wait/waittid 所需的退出码记录。
+
+在本章内核中，``ch8/src/processor.rs`` 将其具体化为：
 
 .. code-block:: rust
-    :linenos:
+   :linenos:
 
-    pub struct ProcessControlBlock {
-        // immutable
-        pub pid: PidHandle,
-        // mutable
-        inner: UPSafeCell<ProcessControlBlockInner>,
-    }
+   // ch8/src/processor.rs
+   pub type ProcessorInner = PThreadManager<Process, Thread, ThreadManager, ProcManager>;
+   pub static PROCESSOR: Processor = Processor::new();
 
-    pub struct ProcessControlBlockInner {
-        ...
-        pub tasks: Vec<Option<Arc<TaskControlBlock>>>,
-        pub task_res_allocator: RecycleAllocator,
-    }
+并实现两个“后端”管理器：
 
-从中可以看出，进程把与处理器执行相关的部分都移到了 ``TaskControlBlock`` 中，并组织为一个线程控制块向量中，
-这就自然对应到多个线程的管理上了。而 ``RecycleAllocator`` 是对之前的 ``PidAllocator`` 的一个升级版，
-即一个相对通用的资源分配器，可用于分配进程标识符（PID）和线程的内核栈（KernelStack）。
-
-.. chyyuu 加一个PidAllocator的链接???
-
-线程与处理器管理结构
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-线程管理的结构是线程管理器，即任务管理器，位于 ``os/src/task/manager.rs`` 中，
-其数据结构和方法与之前章节中进程的任务管理器完全一样，仅负责管理所有线程。而处理器管理结构 ``Processor``
-负责维护 CPU 状态、调度和特权级切换等事务。其数据结构与之前章节中进程的处理器管理结构完全一样。
-但在相关方法上面，由于多个线程有各自的用户栈和跳板页，所以有些不同，下面会进一步分析。
-
-.. chyyuu 加一个taskmanager,processor的链接???
+- **ThreadManager**：用 ``BTreeMap<ThreadId, Thread>`` 保存全部线程实体，用 ``VecDeque<ThreadId>`` 作为就绪队列；
+- **ProcManager**：用 ``BTreeMap<ProcId, Process>`` 保存全部进程实体。
 
 线程管理机制的设计与实现
 -----------------------------------------------
 
-在上述线程模型和内核数据结构的基础上，我们还需完成线程管理的基本实现，从而构造出一个完整的“达科塔盗龙”[#dak]_ 操作系统。
-本节将分析如何实现线程管理：
+本章的线程管理机制由两部分协作完成：
 
-- 线程创建、线程退出与等待线程结束
-- 线程执行中的特权级切换
+- **系统调用抽象与分发**：由 ``tg-syscall`` 提供（traits + ``handle`` 分发器）；
+- **线程/进程与 wait 关系维护**：由 ``tg-task-manage`` 提供（``PThreadManager`` + 关系表）。
 
-.. - 进程管理中与线程相关的处理
+内核启动时会在 ``ch8/src/main.rs`` 中初始化并注册系统调用实现：
 
+.. code-block:: rust
+   :linenos:
 
-线程创建、线程退出与等待线程结束
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   // ch8/src/main.rs（节选）
+   tg_syscall::init_process(&SyscallContext);
+   tg_syscall::init_scheduling(&SyscallContext);
+   tg_syscall::init_clock(&SyscallContext);
+   tg_syscall::init_signal(&SyscallContext);
+   tg_syscall::init_thread(&SyscallContext);
+   tg_syscall::init_sync_mutex(&SyscallContext);
 
+在每次用户态触发 ``ecall`` 返回内核后，内核读取寄存器得到 syscall id 与参数，然后调用
+``tg_syscall::handle(...)`` 完成分发。
 
 线程创建
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-当一个进程执行中发出了创建线程的系统调用 ``sys_thread_create`` 后，操作系统就需要在当前进程的基础上创建一个线程了，
-这里重点是需要了解创建线程控制块，在线程控制块中初始化各个成员变量，建立好进程和线程的关系等。
-只有建立好这些成员变量，才能给线程建立一个灵活方便的执行环境。这里列出支持线程正确运行所需的重要的执行环境要素：
+``thread_create`` 的内核实现位于 ``ch8/src/main.rs`` 中 ``SyscallContext`` 对 ``tg_syscall::Thread`` trait
+的实现。其核心工作可以概括为：
 
-- 线程的用户态栈：确保在用户态的线程能正常执行函数调用；
-- 线程的内核态栈：确保线程陷入内核后能正常执行函数调用；
-- 线程的跳板页：确保线程能正确的进行用户态<-->内核态切换；
-- 线程上下文：即线程用到的寄存器信息，用于线程切换。
-
-线程创建的具体实现如下：
+- 为新线程找到一段尚未映射的用户栈虚拟地址区间；
+- 分配物理页并映射进当前进程地址空间；
+- 构造用户态初始上下文（入口点、栈指针、参数寄存器）；
+- 通过 ``PROCESSOR``（``PThreadManager``）把新线程加入当前进程，并进入就绪队列等待调度。
 
 .. code-block:: rust
-    :linenos:
+   :linenos:
 
-    // os/src/syscall/thread.rs
-
-    pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
-        let task = current_task().unwrap();
-        let process = task.process.upgrade().unwrap();
-        // create a new thread
-        let new_task = Arc::new(TaskControlBlock::new(
-            Arc::clone(&process),
-            task.inner_exclusive_access().res.as_ref().unwrap().ustack_base,
-            true,
-        ));
-        // add new task to scheduler
-        add_task(Arc::clone(&new_task));
-        let new_task_inner = new_task.inner_exclusive_access();
-        let new_task_res = new_task_inner.res.as_ref().unwrap();
-        let new_task_tid = new_task_res.tid;
-        let mut process_inner = process.inner_exclusive_access();
-        // add new thread to current process
-        let tasks = &mut process_inner.tasks;
-        while tasks.len() < new_task_tid + 1 {
-            tasks.push(None);
-        }
-        tasks[new_task_tid] = Some(Arc::clone(&new_task));
-        let new_task_trap_cx = new_task_inner.get_trap_cx();
-        *new_task_trap_cx = TrapContext::app_init_context(
-            entry,
-            new_task_res.ustack_top(),
-            kernel_token(),
-            new_task.kernel_stack.get_top(),
-            trap_handler as usize,
-        );
-        (*new_task_trap_cx).x[10] = arg;
-        new_task_tid as isize
-    }
-
-上述代码主要完成了如下事务：
-
-- 第4-5行，找到当前正在执行的线程 ``task`` 和此线程所属的进程 ``process`` 。
-- 第7-11行，调用 ``TaskControlBlock::new`` 方法，创建一个新的线程 ``new_task`` ，在创建过程中，建立与进程
-  ``process`` 的所属关系，分配了线程用户态栈、内核态栈、用于异常/中断的跳板页。
-- 第13行，把线程挂到调度队列中。
-- 第19-22行，把线程接入到所需进程的线程列表 ``tasks`` 中。
-- 第25~32行，初始化位于该线程在用户态地址空间中的 Trap 上下文：设置线程的函数入口点和用户栈，
-  使得第一次进入用户态时能从线程起始位置开始正确执行；设置好内核栈和陷入函数指针 ``trap_handler`` ，
-  保证在 Trap 的时候用户态的线程能正确进入内核态。
+   // ch8/src/main.rs（节选）
+   fn thread_create(&self, _caller: Caller, entry: usize, arg: usize) -> isize {
+       let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+       let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+       // 省略：扫描虚拟地址空间，找到未映射的栈位置 vpn
+       // 省略：分配两页并 map_extern 到用户地址空间（U_WRV）
+       let satp = (8 << 60) | current_proc.address_space.root_ppn().val();
+       let mut context = tg_kernel_context::LocalContext::user(entry);
+       *context.sp_mut() = /* 新栈顶 */;
+       *context.a_mut(0) = arg;
+       let thread = Thread::new(satp, context);
+       let tid = thread.tid;
+       unsafe { (*processor).add(tid, thread, current_proc.pid) };
+       tid.get_usize() as _
+   }
 
 线程退出
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-当一个非主线程的其他线程发出 ``sys_exit`` 系统调用时，内核会调用 ``exit_current_and_run_next``
-函数退出当前线程并切换到下一个线程，但不会导致其所属进程的退出。当 **主线程** 即进程发出这个系统调用，
-内核会回收整个进程（这包括了其管理的所有线程）资源，并退出。主线程本身不会被立即回收资源，而是延迟回收，我们在 **再往后一段代码** 解释主线程自己如何退出。具体实现如下：
-
-.. code-block:: rust
-    :linenos:
-
-    // os/src/syscall/process.rs
-
-    pub fn sys_exit(exit_code: i32) -> ! {
-        exit_current_and_run_next(exit_code);
-        panic!("Unreachable in sys_exit!");
-    }
-
-    // os/src/task/mod.rs
-
-    pub fn exit_current_and_run_next(exit_code: i32) {
-        let task = take_current_task().unwrap();
-        let mut task_inner = task.inner_exclusive_access();
-        let process = task.process.upgrade().unwrap();
-        let tid = task_inner.res.as_ref().unwrap().tid;
-        // record exit code
-        task_inner.exit_code = Some(exit_code);
-        task_inner.res = None;
-        // here we do not remove the thread since we are still using the kstack
-        // it will be deallocated when sys_waittid is called
-        drop(task_inner);
-        // Move the task to stop-wait status, to avoid kernel stack from being freed
-        if tid == 0 {
-            add_stopping_task(task);
-        } else {
-            drop(task);
-        }
-        // however, if this is the main thread of current process
-        // the process should terminate at once
-        if tid == 0 {
-            let mut process_inner = process.inner_exclusive_access();
-            // mark this process as a zombie process
-            process_inner.is_zombie = true;
-            // record exit code of main process
-            process_inner.exit_code = exit_code;
-            {
-                // move all child processes under init process
-                let mut initproc_inner = INITPROC.inner_exclusive_access();
-                for child in process_inner.children.iter() {
-                    child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-                    initproc_inner.children.push(child.clone());
-                }
-            }
-            let mut recycle_res = Vec::<TaskUserRes>::new();
-            // deallocate user res (including tid/trap_cx/ustack) of all threads
-            // it has to be done before we dealloc the whole memory_set
-            // otherwise they will be deallocated twice
-            for task in process_inner.tasks.iter().filter(|t| t.is_some()) {
-                let task = task.as_ref().unwrap();
-                let mut task_inner = task.inner_exclusive_access();
-                if let Some(res) = task_inner.res.take() {
-                    recycle_res.push(res);
-                }
-            }
-            drop(process_inner);
-            recycle_res.clear();
-            let mut process_inner = process.inner_exclusive_access();
-            process_inner.children.clear();
-            // deallocate other data in user space i.e. program code/data section
-            process_inner.memory_set.recycle_data_pages();
-        }
-        drop(process);
-        // we do not have to save task context
-        let mut _unused = TaskContext::zero_init();
-        schedule(&mut _unused as *mut _);
-    }
-
-上述代码主要完成了如下事务：
-
-- 第11-26行，回收线程的各种资源。注意，如果退出的是主线程，那么需要将当前线程通过 ``add_stopping_task`` 暂时挂起（见下段描述）。因为我们目前正运行在主线程上，删除回收各个线程的资源。如果把主线程自己的内核栈删掉，就会出现未定义行为。
-- 第29-61行，如果是主线程发出的退去请求，则回收整个进程的部分资源，并退出进程。第 33~37
-  行所做的事情是将当前进程的所有子进程挂在初始进程 INITPROC 下面，其做法是遍历每个子进程，
-  修改其父进程为初始进程，并加入初始进程的孩子向量中。第 49 行将当前进程的孩子向量清空。
-- 第63-64行，进行线程调度切换。
-
-上述实现中很大一部分与第五章讲解的 进程的退出 的功能实现大致相同。下面解释临时存储了主线程的 ``add_stopping_task`` 的原理。该函数实现如下：
-
-.. chyyuu 加上链接???
-
-.. code-block:: rust
-    :linenos:
-
-    // os/src/task/manager.rs
-
-    ///A array of `TaskControlBlock` that is thread-safe
-    pub struct TaskManager {
-        ready_queue: VecDeque<Arc<TaskControlBlock>>,
-        
-        /// The stopping task, leave a reference so that the kernel stack will not be recycled when switching tasks
-        stop_task: Option<Arc<TaskControlBlock>>,
-    }
-
-    impl TaskManager {
-        /// other functions omitted.
-
-        /// Add a task to stopping task
-        pub fn add_stop(&mut self, task: Arc<TaskControlBlock>) {
-            // NOTE: as the last stopping task has completely stopped (not
-            // using kernel stack any more, at least in the single-core
-            // case) so that we can simply replace it;
-            self.stop_task = Some(task);
-        }
-
-    }
-
-    /// Set a task to stop-wait status, waiting for its kernel stack out of use.
-    pub fn add_stopping_task(task: Arc<TaskControlBlock>) {
-        TASK_MANAGER.exclusive_access().add_stop(task);
-    }
-
-可以看到，我们在 ``TaskManager`` 的队列外额外添加了一个 ``stop_task`` 变量来保存正在退出的主线程的引用。上一段代码的主线程调用了全局函数 ``add_stopping_task``，实际上是把自己挂在了 ``stop_task`` 上。这样做的好处是，主线程在退出时不会删除自己的内核栈，避免了未定义行为。
-
-而下次有其他进程的主线程调用 ``add_stopping_task`` 时，就会把之前的 ``stop_task`` 挤掉，使得之前的 ``stop_task`` 的引用计数归零，此时它才会被自动清理回收资源。
-
-当然，这种“下一个进程退出时，上一个进程的主线程才被清理”的思路有点慢。你也可以使用其他实现方式，例如在 ``run_tasks()`` 中加一些逻辑来处理。总之，只要保证主线程在清理进程资源的时候，暂时不要清理自己就行。
+线程通过 ``exit`` 系统调用退出。内核在处理 ``SyscallId::EXIT`` 时，会调用
+``PThreadManager::make_current_exited(exit_code)`` 将当前线程从调度器中删除，并在关系表中记录退出码；
+若该线程是进程内最后一个线程，则同时删除进程并维护父子关系（子进程会被转移到 0 号进程名下）。
 
 等待线程结束
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-主线程通过系统调用 ``sys_waittid`` 来等待其他线程的结束。具体实现如下：
+``waittid`` 依赖 ``tg-task-manage`` 的关系表（``ProcThreadRel``）维护退出线程队列 ``dead_threads``：
 
-.. code-block:: rust
-    :linenos:
+- 若目标线程已退出：返回其退出码；
+- 若目标线程仍在运行：返回 ``-2``（用户态会 ``sched_yield`` 并重试）；
+- 若目标线程不存在：返回 ``-1``。
 
-    // os/src/syscall/ch8b_thread.rs
-
-    pub fn sys_waittid(tid: usize) -> i32 {
-        let task = current_task().unwrap();
-        let process = task.process.upgrade().unwrap();
-        let task_inner = task.inner_exclusive_access();
-        let mut process_inner = process.inner_exclusive_access();
-        // a thread cannot wait for itself
-        if task_inner.res.as_ref().unwrap().tid == tid {
-            return -1;
-        }
-        let mut exit_code: Option<i32> = None;
-        let waited_task = process_inner.tasks[tid].as_ref();
-        if let Some(waited_task) = waited_task {
-            if let Some(waited_exit_code) = waited_task.inner_exclusive_access().exit_code {
-                exit_code = Some(waited_exit_code);
-            }
-        } else {
-            // waited thread does not exist
-            return -1;
-        }
-        if let Some(exit_code) = exit_code {
-            // dealloc the exited thread
-            process_inner.tasks[tid] = None;
-            exit_code
-        } else {
-            // waited thread has not exited
-            -2
-        }
-    }
-
-上述代码主要完成了如下事务：
-
-- 第9-10行，如果是线程等自己，返回错误.
-- 第12-21行，如果找到 ``tid`` 对应的退出线程，则收集该退出线程的退出码 ``exit_tid`` ，否则返回错误（退出线程不存在）。
-- 第22-29行，如果退出码存在，则清空进程中对应此退出线程的线程控制块（至此，线程所占资源算是全部清空了），否则返回错误（线程还没退出）。
+对应的内核实现位于 ``SyscallContext::waittid``（``ch8/src/main.rs``），其本质是调用
+``PThreadManager::waittid(ThreadId)`` 查询关系表。
 
 
 线程执行中的特权级切换和调度切换
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-线程执行中的特权级切换与第三章中 **任务切换的设计与实现** 小节中讲解的过程是一致的。而线程执行中的调度切换过程与第五章的 **进程调度机制** 小节中讲解的过程是一致的。
-这里就不用再赘述一遍了。
+本章的“进入用户态执行/从用户态返回内核”由 ``tg-kernel-context`` 的 ``ForeignContext`` 与
+``MultislotPortal`` 协作完成：内核调度到某个线程时，调用
+``task.context.execute(portal, ())`` 进入该线程的用户态上下文；当发生 ``ecall``/异常时返回到内核，
+内核在 ``rust_main`` 的调度循环中根据返回原因（如 ``UserEnvCall``）完成系统调用分发，并根据结果将当前线程
+设置为 **就绪（suspend，重新入队）** / **阻塞（blocked，不入队）** / **退出（exited，删除实体）**。
 
 
-.. [#dak] 达科塔盗龙是一种生存于距今6700万-6500万年前白垩纪晚期的兽脚类驰龙科恐龙，它主打的并不是霸王龙的力量路线，而是利用自己修长的后肢来提高敏捷度和奔跑速度。它全身几乎都长满了羽毛，可能会滑翔或者其他接近飞行行为的行动模式。

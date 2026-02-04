@@ -84,44 +84,49 @@
 实践体验
 -----------------------------------------
 
-获取本章代码：
+在 ``rCore-Tutorial-in-single-workspace`` 项目中运行本章代码：
 
 .. code-block:: console
 
-   $ git clone https://github.com/LearningOS/rCore-Tutorial-Code.git
-   $ cd rCore-Tutorial-Code
-   $ git checkout ch8
-   $ git clone https://github.com/LearningOS/rCore-Tutorial-Test.git user
+   $ cd rCore-Tutorial-in-single-workspace/ch8
+   $ cargo run
 
-记得更新测例仓库的代码。
+.. note::
 
-在 qemu 模拟器上运行本章代码：
+   第一次运行时，``tg-ch8`` 会在构建阶段准备用户程序并打包文件系统镜像：
 
-.. code-block:: console
+   - 默认会在 ``ch8/tg-user`` 下拉取 ``tg-user`` 源码（需要安装 ``cargo-clone``），并编译本章测例；
+   - 然后将编译产物写入 easy-fs 磁盘镜像 ``target/riscv64gc-unknown-none-elf/debug/fs.img``；
+   - ``cargo run`` 会通过 ``ch8/.cargo/config.toml`` 中配置的 QEMU runner 启动模拟器，并将该镜像作为
+     virtio-blk 挂载，内核据此按文件名加载并执行用户程序。
 
-   $ cd os
-   $ make run
+   如果你已有本地 ``tg-user``，可通过环境变量 ``TG_USER_DIR`` 指定路径；也可用 ``TG_USER_VERSION``
+   覆盖默认拉取版本。练习模式可使用 ``cargo run --features exercise`` 。
 
-内核初始化完成之后就会进入 shell 程序，我们可以体会一下线程的创建和执行过程。在这里我们运行一下本章的测例 ``ch8b_threads`` ：
+内核初始化完成之后就会进入用户态的 shell 程序（见 ``tg-user`` 中的 ``user_shell``/``initproc``），
+我们可以体会一下线程的创建和执行过程。例如运行测例 ``threads`` ：
 
 .. code-block::
 
-    >> ch8b_threads
-    aaa....bbb...ccc...
+    >> threads
+    v :[1, 2, 3]
+    create tid: 4
+    create tid: 4 end
+    ...
     thread#1 exited with code 1
     thread#2 exited with code 2
     thread#3 exited with code 3
     main thread exited.
-    Shell: Process 2 exited with code 0
+    threads test passed!
     >>
 
 它会有4个线程在执行，等前3个线程执行完毕后，主线程退出，导致整个进程退出。
 
-此外，在本章的操作系统支持通过互斥来执行“哲学家就餐问题”这个应用程序：
+此外，在本章的操作系统支持通过互斥锁来执行“哲学家就餐问题”这个应用程序：
 
 .. code-block::
 
-    >> ch8b_phil_din_mutex
+    >> phil_din_mutex
     Here comes 5 philosophers!
     time cost = 720
     '-' -> THINKING; 'x' -> EATING; ' ' -> WAITING
@@ -131,10 +136,10 @@
     #3: -----xxxxxxxxxx------xxxxx--------    xxxxxx--   xxxxxxxxx
     #4: ------         x------          xxxxxx--    xxxxx------   xx
     #0: -------                 xxxxxxxx----------       xxxx-----  xxxxxx--xxx
-    Shell: Process 2 exited with code 0
+    philosopher dining problem with mutex test passed!
     >>
 
-我们可以看到5个代表“哲学家”的线程通过操作系统的 **信号量** 互斥机制在进行 “THINKING”、“EATING”、“WAITING” 的日常生活。
+我们可以看到5个代表“哲学家”的线程通过操作系统的 **互斥锁（mutex）** 在进行 “THINKING”、“EATING”、“WAITING” 的日常生活。
 没有哲学家由于拿不到筷子而饥饿，也没有两个哲学家同时拿到一个筷子。
 
 .. note::
@@ -151,89 +156,21 @@
 -----------------------------------------
 
 .. code-block::
-   :linenos:
 
-    .
-    ├── bootloader
-    │   └── rustsbi-qemu.bin
-    ├── Dockerfile
-    ├── easy-fs
-    │   ├── Cargo.lock
-    │   ├── Cargo.toml
-    │   └── src
-    │       ├── bitmap.rs
-    │       ├── block_cache.rs
-    │       ├── block_dev.rs
-    │       ├── efs.rs
-    │       ├── layout.rs
-    │       ├── lib.rs
-    │       └── vfs.rs
-    ├── easy-fs-fuse
-    │   ├── Cargo.lock
-    │   ├── Cargo.toml
-    │   └── src
-    │       └── main.rs
-    ├── LICENSE
-    ├── Makefile
-    ├── os
-    │   ├── build.rs
-    │   ├── Cargo.lock
-    │   ├── Cargo.toml
-    │   ├── Makefile
-    │   └── src
-    │       ├── config.rs (修改：扩大了内核堆空间)
-    │       ├── console.rs
-    │       ├── drivers
-    │       │   ├── block
-    │       │   │   ├── mod.rs
-    │       │   │   └── virtio_blk.rs
-    │       │   └── mod.rs
-    │       ├── entry.asm
-    │       ├── fs
-    │       │   ├── inode.rs
-    │       │   ├── mod.rs
-    │       │   ├── pipe.rs
-    │       │   └── stdio.rs
-    │       ├── lang_items.rs
-    │       ├── linker.ld
-    │       ├── logging.rs
-    │       ├── main.rs
-    │       ├── mm
-    │       │   ├── address.rs
-    │       │   ├── frame_allocator.rs
-    │       │   ├── heap_allocator.rs
-    │       │   ├── memory_set.rs (修改：去除了构建进程地址空间时分配用户栈和映射陷入上下文的逻辑)
-    │       │   ├── mod.rs
-    │       │   └── page_table.rs
-    │       ├── sbi.rs
-    │       ├── sync (新增：互斥锁、信号量和条件变量三种同步互斥机制的实现)
-    │       │   ├── condvar.rs
-    │       │   ├── mod.rs
-    │       │   ├── mutex.rs
-    │       │   ├── semaphore.rs
-    │       │   └── up.rs
-    │       ├── syscall
-    │       │   ├── fs.rs (修改：将原先对 task 的调用改为对 process 的调用)
-    │       │   ├── mod.rs
-    │       │   ├── process.rs (修改：将原先对 task 的调用改为对 process 的调用)
-    │       │   ├── sync.rs (新增：三种同步互斥机制相关的系统调用，以及基于定时器条件变量的 sleep 调用)
-    │       │   └── thread.rs (新增：线程相关系统调用)
-    │       ├── task
-    │       │   ├── context.rs (修改：将任务上下文的成员变量改为 pub 类型)
-    │       │   ├── id.rs (新增：由 pid.rs 修改而来，提供 pid/tid 、 kstack/ustack 的分配和回收机制)
-    │       │   ├── kthread.rs (新增：完全在内核态运行的线程，仅供参考，在实验中未使用)
-    │       │   ├── manager.rs
-    │       │   ├── mod.rs (修改：增加阻塞线程的功能，将 exit 扩展到多线程，并在主线程退出时一并退出进程)
-    │       │   ├── processor.rs (修改：增加获取当前线程的中断上下文虚拟地址及获取当前进程的功能)
-    │       │   ├── process.rs (新增：将原先 Task 中的地址空间、文件等机制拆分为进程)
-    │       │   ├── stackless_coroutine.rs (新增：完全在内核态运行的无栈协程，仅供参考，在实验中未使用)
-    │       │   ├── switch.rs
-    │       │   ├── switch.S
-    │       │   └── task.rs (修改：将进程相关的功能移至 process.rs 中)
-    │       ├── timer.rs (修改：增加定时器条件变量的实现)
-    │       └── trap
-    │           ├── context.rs
-    │           ├── mod.rs (修改：使用线程对应的中断上下文地址而非固定的 TRAP_CONTEXT)
-    │           └── trap.S
-    ├── README.md
-    └── rust-toolchain
+   rCore-Tutorial-in-single-workspace/
+   ├── ch8/                         # 本章内核（crate: tg-ch8）
+   │   ├── .cargo/config.toml        # QEMU runner 配置（`cargo run` 直接启动 QEMU）
+   │   ├── build.rs                  # 构建 tg-user 并打包 easy-fs 镜像 fs.img
+   │   ├── Cargo.toml
+   │   └── src
+   │       ├── main.rs               # 内核入口、syscall 初始化与分发、调度循环
+   │       ├── process.rs            # `Process`/`Thread`（共享资源 vs 执行上下文）
+   │       ├── processor.rs          # 基于 `tg-task-manage` 的线程/进程管理与调度队列
+   │       ├── fs.rs                 # easy-fs 文件系统封装（供 syscall/open/read/write 使用）
+   │       └── virtio_block.rs       # virtio-blk 块设备驱动
+   ├── tg-syscall/                   # 系统调用号、用户/内核接口、统一分发 `handle`
+   ├── tg-task-manage/               # 线程/进程管理框架（`ProcId`/`ThreadId`、调度器骨架）
+   ├── tg-sync/                      # 同步原语（Mutex/Semaphore/Condvar）
+   ├── tg-kernel-context/            # 上下文与“异界传送门”（执行用户态并返回内核）
+   ├── tg-kernel-vm/                 # 地址空间/页表（Sv39）
+   └── tg-easy-fs/                   # 文件系统与管道（运行时由 virtio-blk 提供块设备）

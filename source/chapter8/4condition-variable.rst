@@ -176,124 +176,91 @@ A 为 1，让线程 second 等待的条件满足，然后会执行条件变量�
 
 .. code-block:: rust
     :linenos:
-    :emphasize-lines: 11,19,26,33,36,39
 
-    static mut A: usize = 0;   //全局变量
-
+    // tg-user/src/bin/test_condvar.rs（节选）
+    static mut A: usize = 0;
     const CONDVAR_ID: usize = 0;
     const MUTEX_ID: usize = 0;
 
-    unsafe fn first() -> ! {
+    unsafe fn first() -> isize {
         sleep(10);
         println!("First work, Change A --> 1 and wakeup Second");
         mutex_lock(MUTEX_ID);
-        A=1;
+        A = 1;
         condvar_signal(CONDVAR_ID);
         mutex_unlock(MUTEX_ID);
-        ...
+        exit(0)
     }
-    unsafe fn second() -> ! {
+
+    unsafe fn second() -> isize {
         println!("Second want to continue,but need to wait A=1");
         mutex_lock(MUTEX_ID);
-        while A==0 {
+        while (&raw const A).read_volatile() == 0 {
             condvar_wait(CONDVAR_ID, MUTEX_ID);
         }
         mutex_unlock(MUTEX_ID);
-        ...
+        exit(0)
     }
-    pub fn main() -> i32 {
-        // create condvar & mutex
+
+    pub extern "C" fn main() -> i32 {
         assert_eq!(condvar_create() as usize, CONDVAR_ID);
-        assert_eq!(mutex_blocking_create() as usize, MUTEX_ID);
-        // create first, second threads
-        ...
+        assert_eq!(mutex_create(true) as usize, MUTEX_ID);
+        // create threads ...
+        0
     }
 
-    pub fn condvar_create() -> isize {
-        sys_condvar_create(0)
-    }
-    pub fn condvar_signal(condvar_id: usize) {
-        sys_condvar_signal(condvar_id);
-    }
-    pub fn condvar_wait(condvar_id: usize, mutex_id: usize) {
-        sys_condvar_wait(condvar_id, mutex_id);
-    }
-
-- 第 26 行，创建了一个 ID 为 ``CONDVAR_ID`` 的条件量，对应第 33 行 ``SYSCALL_CONDVAR_CREATE`` 系统调用；
-- 第 19 行，线程 Second 执行条件变量 ``wait`` 操作（对应第 39 行 ``SYSCALL_CONDVAR_WAIT`` 系统调用），
-  该线程将释放 ``mutex`` 锁并阻塞；
-- 第 5 行，线程 First 执行条件变量 ``signal`` 操作（对应第 36 行 ``SYSCALL_CONDVAR_SIGNAL`` 系统调用），
-  会唤醒等待该条件变量的线程 Second。
+其中 ``condvar_*`` 接口由 ``tg-syscall`` 在 ``tg-syscall/src/user.rs`` 中提供封装，底层通过 ``ecall`` 进入内核。
 
 
 实现 condvar 系统调用
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-操作系统如何实现条件变量系统调用呢？在线程的眼里，条件变量是一种每个线程能看到的共享资源，
-且在一个进程中，可以存在多个不同条件变量资源，所以我们可以把所有的条件变量资源放在一起让进程来管理，
-如下面代码第9行所示。这里需要注意的是： ``condvar_list: Vec<Option<Arc<Condvar>>>``
-表示的是条件变量资源的列表。而 ``Condvar`` 是条件变量的内核数据结构，由等待队列组成。
-操作系统需要显式地施加某种控制，来确定当一个线程执行 ``wait`` 操作和 ``signal`` 操作时，
-如何让线程睡眠或唤醒线程。在这里， ``wait`` 操作是由 ``Condvar`` 的 ``wait`` 方法实现，而 ``signal``
-操作是由 ``Condvar`` 的 ``signal`` 方法实现。
+本章同样遵循组件化分层：条件变量的数据结构由 ``tg-sync`` 提供，而“阻塞/唤醒/调度”由内核统一处理。
+
+核心数据结构
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+条件变量列表归属于进程（同一进程内线程共享）：
 
 .. code-block:: rust
-    :linenos:
-    :emphasize-lines: 9,15,18,27,33
+   :linenos:
 
-    pub struct ProcessControlBlock {
-        // immutable
-        pub pid: PidHandle,
-        // mutable
-        inner: UPSafeCell<ProcessControlBlockInner>,
-    }
-    pub struct ProcessControlBlockInner {
-        ...
-        pub condvar_list: Vec<Option<Arc<Condvar>>>,
-    }
-    pub struct Condvar {
-        pub inner: UPSafeCell<CondvarInner>,
-    }
-    pub struct CondvarInner {
-        pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
-    }
-    impl Condvar {
-        pub fn new() -> Self {
-            Self {
-                inner: unsafe { UPSafeCell::new(
-                    CondvarInner {
-                        wait_queue: VecDeque::new(),
-                    }
-                )},
-            }
-        }
-        pub fn signal(&self) {
-            let mut inner = self.inner.exclusive_access();
-            if let Some(task) = inner.wait_queue.pop_front() {
-                wakeup_task(task);
-            }
-        }
-        pub fn wait(&self, mutex:Arc<dyn Mutex>) {
-            mutex.unlock();
-            let mut inner = self.inner.exclusive_access();
-            inner.wait_queue.push_back(current_task().unwrap());
-            drop(inner);
-            block_current_and_run_next();
-            mutex.lock();
-        }
-    }
+   // ch8/src/process.rs（节选）
+   pub struct Process {
+       // ...
+       pub condvar_list: Vec<Option<Arc<Condvar>>>,
+   }
 
-首先是核心数据结构：
+``tg-sync`` 的 ``Condvar`` 内部维护等待队列（保存 ``ThreadId``）：
 
-- 第 9 行，进程控制块中管理的条件变量列表。
-- 第 15 行，条件变量的核心数据成员：等待队列。
+.. code-block:: rust
+   :linenos:
 
-然后是重要的三个成员函数：
+   // tg-sync/src/condvar.rs（节选）
+   pub struct CondvarInner {
+       pub wait_queue: VecDeque<ThreadId>,
+   }
 
-- 第 18 行，创建条件变量，即创建了一个空的等待队列。
-- 第 27 行，实现 ``signal`` 操作，将从条件变量的等待队列中弹出一个线程放入线程就绪队列。
-- 第 33 行，实现 ``wait`` 操作，释放 ``mutex`` 互斥锁，将把当前线程放入条件变量的等待队列，
-  设置当前线程为挂起状态并选择新线程执行。在恢复执行后，再加上 ``mutex`` 互斥锁。
+   impl Condvar {
+       pub fn new() -> Self { /* ... */ }
+       pub fn signal(&self) -> Option<ThreadId> { /* pop_front */ }
+   }
+
+系统调用与实现现状
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+内核通过实现 ``tg_syscall::SyncMutex`` trait 提供 ``condvar_*`` 系列系统调用（位于 ``ch8/src/main.rs``）：
+
+- ``condvar_create``：在当前进程的 ``condvar_list`` 中分配一个新的 ``Condvar``；
+- ``condvar_signal``：调用 ``condvar.signal()``，若返回某个等待线程的 TID，则 ``PROCESSOR.re_enque(tid)`` 重新入队；
+- ``condvar_wait``：当前实现使用 ``tg-sync`` 中的一个 **简化版** 辅助函数 ``wait_with_mutex``，
+  其行为是“先释放 mutex 并唤醒一个等待该 mutex 的线程，然后当前线程立刻尝试重新获取 mutex”。
+
+.. note::
+
+   上述 ``wait_with_mutex`` 并未完整实现本节前面介绍的 Mesa/Hoare 等条件变量语义（例如：把线程真正挂到 condvar 的等待队列并睡眠，
+   以及被 signal 唤醒后再竞争 mutex）。它是为了便于通过教学测例而提供的最小实现；后续若要实现更接近真实 OS 的 condvar，
+   应当让 ``condvar_wait`` 将线程加入 ``CondvarInner.wait_queue`` 并阻塞，``condvar_signal`` 再把对应线程唤醒回就绪队列。
 
 Hansen, Per Brinch (1993). "Monitors and concurrent Pascal: a personal history". HOPL-II:
 The second ACM SIGPLAN conference on History of programming languages. History of Programming

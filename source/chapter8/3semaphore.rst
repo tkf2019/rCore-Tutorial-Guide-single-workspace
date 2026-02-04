@@ -142,127 +142,81 @@ B-stmts 会先执行，然后才是线程 A 的 A-stmts 开始执行。相关伪
 
 .. code-block:: rust
     :linenos:
-    :emphasize-lines: 5,10,16,22,25,28
 
-    const SEM_SYNC: usize = 0; //信号量ID
-    unsafe fn first() -> ! {
+    // tg-user/src/bin/sync_sem.rs（节选）
+    const SEM_SYNC: usize = 0; // 信号量 ID
+
+    unsafe fn first() -> isize {
         sleep(10);
         println!("First work and wakeup Second");
-        semaphore_up(SEM_SYNC); //信号量V操作
+        semaphore_up(SEM_SYNC); // V 操作
         exit(0)
     }
-    unsafe fn second() -> ! {
+
+    unsafe fn second() -> isize {
         println!("Second want to continue,but need to wait first");
-        semaphore_down(SEM_SYNC); //信号量P操作
+        semaphore_down(SEM_SYNC); // P 操作（可能阻塞）
         println!("Second can work now");
         exit(0)
     }
-    pub fn main() -> i32 {
-        // create semaphores
-        assert_eq!(semaphore_create(0) as usize, SEM_SYNC); // 信号量初值为0
-        // create first, second threads
-        ...
+
+    pub extern "C" fn main() -> i32 {
+        assert_eq!(semaphore_create(0) as usize, SEM_SYNC); // 初值为 0
+        let threads = vec![
+            thread_create(first as *const () as usize, 0),
+            thread_create(second as *const () as usize, 0),
+        ];
+        for tid in threads.iter() { waittid(*tid as usize); }
+        0
     }
 
-    pub fn sys_semaphore_create(res_count: usize) -> isize {
-        syscall(SYSCALL_SEMAPHORE_CREATE, [res_count, 0, 0])
-    }
-    pub fn sys_semaphore_up(sem_id: usize) -> isize {
-        syscall(SYSCALL_SEMAPHORE_UP, [sem_id, 0, 0])
-    }
-    pub fn sys_semaphore_down(sem_id: usize) -> isize {
-        syscall(SYSCALL_SEMAPHORE_DOWN, [sem_id, 0, 0])
-    }
-
-
-- 第 16 行，创建了一个初值为 0 ，ID 为 ``SEM_SYNC`` 的信号量，对应的是第 22 行
-  ``SYSCALL_SEMAPHORE_CREATE`` 系统调用；
-- 第 10 行，线程 Second 执行信号量 P 操作（对应第 28行 ``SYSCALL_SEMAPHORE_DOWN``
-  系统调用），由于信号量初值为 0 ，该线程将阻塞；
-- 第 5 行，线程 First 执行信号量 V 操作（对应第 25 行 ``SYSCALL_SEMAPHORE_UP`` 系统调用），
-  会唤醒等待该信号量的线程 Second。
+其中 ``semaphore_create/semaphore_up/semaphore_down`` 由 ``tg-syscall`` 在 ``tg-syscall/src/user.rs`` 中封装，
+底层通过 ``ecall`` 进入内核。
 
 实现 semaphore 系统调用
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-操作系统如何实现信号量系统调用呢？我们还是采用通常的分析做法：数据结构+方法，
-即首先考虑一下与此相关的核心数据结构，然后考虑与数据结构相关的相关函数/方法的实现。
+与 mutex 类似，本章将信号量的核心实现放在 ``tg-sync`` 组件中，而把阻塞/唤醒交给内核调度器完成。
 
-在线程的眼里，信号量是一种每个线程能看到的共享资源，且在一个进程中，可以存在多个不同信号量资源，
-所以我们可以把所有的信号量资源放在一起让进程来管理，如下面代码第 9 行所示。这里需要注意的是：
-``semaphore_list: Vec<Option<Arc<Semaphore>>>`` 表示的是信号量资源的列表。而 ``Semaphore``
-是信号量的内核数据结构，由信号量值和等待队列组成。操作系统需要显式地施加某种控制，来确定当一个线程执行
-P 操作和 V 操作时，如何让线程睡眠或唤醒线程。在这里，P 操作是由 ``Semaphore`` 的 ``down``
-方法实现，而 V 操作是由 ``Semaphore`` 的 ``up`` 方法实现。
+核心数据结构
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+信号量列表归属于进程（同一进程内线程共享）：
 
 .. code-block:: rust
-    :linenos:
-    :emphasize-lines: 9,16,17,34-36,44-47
+   :linenos:
 
-    pub struct ProcessControlBlock {
-        // immutable
-        pub pid: PidHandle,
-        // mutable
-        inner: UPSafeCell<ProcessControlBlockInner>,
-    }
-    pub struct ProcessControlBlockInner {
-        ...
-        pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
-    }
+   // ch8/src/process.rs（节选）
+   pub struct Process {
+       // ...
+       pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
+   }
 
-    pub struct Semaphore {
-        pub inner: UPSafeCell<SemaphoreInner>,
-    }
-    pub struct SemaphoreInner {
-        pub count: isize,
-        pub wait_queue: VecDeque<Arc<TaskControlBlock>>,
-    }
-    impl Semaphore {
-        pub fn new(res_count: usize) -> Self {
-            Self {
-                inner: unsafe { UPSafeCell::new(
-                    SemaphoreInner {
-                        count: res_count as isize,
-                        wait_queue: VecDeque::new(),
-                    }
-                )},
-            }
-        }
+``tg-sync`` 的 ``Semaphore`` 由一个计数器与等待队列构成，等待队列中保存被阻塞线程的 ``ThreadId``：
 
-        pub fn up(&self) {
-            let mut inner = self.inner.exclusive_access();
-            inner.count += 1;
-            if inner.count <= 0 {
-                if let Some(task) = inner.wait_queue.pop_front() {
-                    add_task(task);
-                }
-            }
-        }
+.. code-block:: rust
+   :linenos:
 
-        pub fn down(&self) {
-            let mut inner = self.inner.exclusive_access();
-            inner.count -= 1;
-            if inner.count < 0 {
-                inner.wait_queue.push_back(current_task().unwrap());
-                drop(inner);
-                block_current_and_run_next();
-            }
-        }
-    }
+   // tg-sync/src/semaphore.rs（节选）
+   pub struct SemaphoreInner {
+       pub count: isize,
+       pub wait_queue: VecDeque<ThreadId>,
+   }
 
+   impl Semaphore {
+       pub fn up(&self) -> Option<ThreadId> { /* count += 1; pop_front */ }
+       pub fn down(&self, tid: ThreadId) -> bool { /* count -= 1; push tid if < 0 */ }
+   }
 
-首先是核心数据结构：
+系统调用与阻塞/唤醒
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- 第 9 行，进程控制块中管理的信号量列表。
-- 第 16-17 行，信号量的核心数据成员：信号量值和等待队列。
+内核通过实现 ``tg_syscall::SyncMutex`` trait 提供 ``semaphore_*`` 系列系统调用（位于 ``ch8/src/main.rs``）：
 
-然后是重要的三个成员函数：
+- ``semaphore_down``：若 ``down(tid)`` 返回 ``false``，内核返回 ``-1``，并在 syscall 分发后把当前线程标记为 blocked；
+- ``semaphore_up``：若 ``up()`` 返回某个等待线程的 TID，则调用 ``PROCESSOR.re_enque(tid)`` 将其放回就绪队列。
 
-- 第 20 行，创建信号量，信号量初值为参数 ``res_count`` 。
-- 第 31 行，实现 V 操作的 ``up`` 函数，第 34 行，当信号量值小于等于 0 时，
-  将从信号量的等待队列中弹出一个线程放入线程就绪队列。
-- 第 41 行，实现 P 操作的 ``down`` 函数，第 44 行，当信号量值小于 0 时，
-  将把当前线程放入信号量的等待队列，设置当前线程为挂起状态并选择新线程执行。
+这使得“同步原语维护等待队列 + 调度器维护就绪队列”的分层更加清晰。
 
 
 Dijkstra, Edsger W. Cooperating sequential processes (EWD-123) (PDF). E.W. Dijkstra Archive.
